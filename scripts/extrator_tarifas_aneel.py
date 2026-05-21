@@ -2,111 +2,50 @@
 """
 Extrator de Tarifas ANEEL — Base de Dados Tarifas Homologadas
 =============================================================
-Fonte: https://dadosabertos.aneel.gov.br/dataset/tarifas-distribuidoras-energia-eletrica
-API:   CKAN Datastore (sem scraping de Power BI)
+Fonte: https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!
 
-INSTALAÇÃO:
-    pip install requests pandas
+COMO OBTER O ARQUIVO:
+    1. Acesse https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!
+    2. Aplique os filtros:
+       - Tipo de Outorga: Concessionária
+       - Base Tarifária: Tarifa de Aplicação
+       - Ano, Mês: mais recente disponível
+    3. Clique em "Baixar dados" → "Dados com layout atual" → xlsx → Exportar
+    4. Salve o arquivo como data.xlsx na mesma pasta deste script
 
 USO:
-    python3 extrator_tarifas_aneel.py                    # gera JSON + CSV
-    python3 extrator_tarifas_aneel.py --output meu.json  # nome customizado
-    python3 extrator_tarifas_aneel.py --csv              # também exporta CSV
-    python3 extrator_tarifas_aneel.py --sigla ENEL-SP    # só uma distribuidora
-    python3 extrator_tarifas_aneel.py --debug            # mostra amostra dos dados brutos
+    python3 extrator_tarifas_aneel.py                        # processa data.xlsx
+    python3 extrator_tarifas_aneel.py --input meu_arquivo.xlsx
+    python3 extrator_tarifas_aneel.py --output tarifas.json --csv
+    python3 extrator_tarifas_aneel.py --sigla "Enel SP"      # só uma distribuidora
 
-FILTROS APLICADOS (conforme especificação):
-    • Tipo de outorga: apenas concessionárias
-    • REH: resolução homologatória mais recente por distribuidora
-    • Base tarifária: apenas "Tarifa de Aplicação"
+FILTROS APLICADOS:
+    • Remove linhas de metadados/filtros embutidas no Excel
+    • Mantém apenas Base Tarifária = "Tarifa de Aplicação"
+    • Seleciona a REH mais recente por distribuidora
 """
 
 import argparse
 import json
-import ssl
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.ssl_ import create_urllib3_context
-except ImportError:
-    print("❌  Execute: pip install requests")
-    sys.exit(1)
-
-try:
     import pandas as pd
 except ImportError:
-    print("❌  Execute: pip install pandas")
+    print("❌  Execute: pip install pandas openpyxl")
     sys.exit(1)
 
-
-# ─── SSL ADAPTER ──────────────────────────────────────────────────────────────
-# O servidor dadosabertos.aneel.gov.br usa TLS legado que causa SSLEOFError
-# com as configurações padrão do requests. Este adapter força configurações
-# mais permissivas compatíveis com o servidor da ANEEL.
-
-class LegacySSLAdapter(HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        ctx = create_urllib3_context()
-        ctx.set_ciphers("DEFAULT@SECLEVEL=1")
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        kwargs["ssl_context"] = ctx
-        super().init_poolmanager(*args, **kwargs)
-
-
-def make_session() -> requests.Session:
-    session = requests.Session()
-    session.mount("https://dadosabertos.aneel.gov.br", LegacySSLAdapter())
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; tarifas-aneel-extractor/1.0)",
-        "Accept": "application/json, text/plain, */*",
-    })
-    return session
-
-
-SESSION = make_session()
-
-# ─── CONFIGURAÇÃO ─────────────────────────────────────────────────────────────
-
-RESOURCE_ID   = "fcf2906c-7c32-4b9b-a637-054e7a5234f4"
-API_BASE      = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
-API_SQL       = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search_sql"
-CSV_DOWNLOAD  = (
-    "https://dadosabertos.aneel.gov.br/dataset/5a583f3e-1646-4f67-bf0f-69db4203e89e"
-    "/resource/fcf2906c-7c32-4b9b-a637-054e7a5234f4"
-    "/download/tarifas-homologadas-distribuidoras-energia-eletrica.csv"
-)
-DEFAULT_OUTPUT = "tarifas_aneel_homologadas.json"
-PAGE_SIZE      = 10_000   # registros por chamada à API
-
-# Concessionárias conhecidas (usadas para filtragem e fallback)
-# Fonte: ANEEL — lista de distribuidoras com outorga de concessão
-SIGLAS_CONCESSIONARIAS = {
-    "ENEL-SP", "ENEL-CE", "ENEL-GO", "ENEL-RJ",
-    "ELEKTRO", "EDP-SP", "EDP-ES", "CPFL-PAULISTA",
-    "CPFL-PIRATININGA", "CPFL-SUL", "CPFL-JAGUARI",
-    "COPEL-DIS", "CEMIG-D", "LIGHT", "CELESC-DIS",
-    "EQUATORIAL-MA", "EQUATORIAL-PA", "EQUATORIAL-AL",
-    "EQUATORIAL-PI", "EQUATORIAL-GO", "EQUATORIAL-MS",
-    "ENERGISA-MT", "ENERGISA-MS", "ENERGISA-PB",
-    "ENERGISA-TO", "ENERGISA-MG", "ENERGISA-SE",
-    "COELBA", "CELPE", "COSERN", "COELCE",
-    "AMAZONAS-ENERGIA", "CERON", "BOA-VISTA-ENERGIA",
-    "AES-SUL", "RGE-SUL", "RGE", "CELG-D",
-    "CHESP", "CEB-D", "CELB", "CEMAR", "CEAL",
-    "CEPISA", "SULGIPE", "DMED",
-}
+DEFAULT_INPUT  = "data.xlsx"
+DEFAULT_OUTPUT = "data/tarifas_aneel.json"
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def parse_float_br(s):
-    """Converte string pt-BR (vírgula decimal) para float."""
-    if s is None or str(s).strip() in ("", "-", "nan"):
+    if s is None or str(s).strip() in ("", "-", "nan", "0"):
         return None
     try:
         return float(str(s).replace(".", "").replace(",", "."))
@@ -115,12 +54,8 @@ def parse_float_br(s):
 
 
 def normaliza_reh(reh: str) -> tuple:
-    """
-    Extrai (numero, ano) de strings como '3477/2025' ou 'REH nº 3.477/2025'
-    para ordenação correta da resolução mais recente.
-    """
-    import re
-    m = re.search(r"(\d[\d\.]+)\s*/\s*(\d{4})", str(reh))
+    """Extrai (ano, numero) de 'REH Nº 3.477, DE 21 DE MARÇO DE 2025' para ordenação."""
+    m = re.search(r"(\d[\d\.]+).*?(\d{4})\s*$", str(reh).strip())
     if not m:
         return (0, 0)
     num = int(m.group(1).replace(".", ""))
@@ -128,191 +63,131 @@ def normaliza_reh(reh: str) -> tuple:
     return (ano, num)
 
 
-def eh_concessionaria(sigla: str) -> bool:
-    """
-    Heurística para identificar concessionárias vs cooperativas/permissionárias.
-    Cooperativas geralmente contêm 'COOP', 'CERPA', 'CERAES', 'COOPERTRADIÇÃO'
-    Permissionárias: 'PERM' ou sufixo '-PERM'
-    """
-    s = sigla.upper()
-    # Exclui explicitamente cooperativas e permissionárias
-    if any(p in s for p in ["COOP", "CERPA", "CERAL", "CERES",
-                              "CERTAJA", "HIDROPAN", "UHENPAL",
-                              "-PERM", "PERM-"]):
+def eh_linha_valida(sigla: str) -> bool:
+    """Descarta linhas de metadados embutidas no Excel do Power BI."""
+    if not sigla or not str(sigla).strip():
         return False
+    s = str(sigla).strip()
+    # Linhas de metadados contêm frases dos filtros aplicados
+    for termo in ["Filtros", "Base Tarifária", "Tipo de Outorga",
+                  "Ano é", "Flag é", "Em branco"]:
+        if termo in s:
+            return False
     return True
 
 
-# ─── DOWNLOAD DOS DADOS ───────────────────────────────────────────────────────
+# ─── LEITURA E PROCESSAMENTO ──────────────────────────────────────────────────
 
-def baixar_via_api_paginada(filtro_sigla=None, debug=False) -> pd.DataFrame:
-    """
-    Baixa todos os registros via API CKAN com paginação.
-    Aplica filtro de base tarifária = 'Tarifa de Aplicação' na query.
-    """
-    print("📡  Conectando à API CKAN (Dados Abertos ANEEL)...")
-
-    todos = []
-    offset = 0
-
-    # Filtros diretos suportados pela API CKAN datastore
-    filtros = {"DscBaseTarifaria": "Tarifa de Aplicação"}
-    if filtro_sigla:
-        filtros["SigAgente"] = filtro_sigla.upper()
-
-    while True:
-        params = {
-            "resource_id": RESOURCE_ID,
-            "limit":       PAGE_SIZE,
-            "offset":      offset,
-            "filters":     json.dumps(filtros),
-        }
-        try:
-            resp = SESSION.get(API_BASE, params=params, timeout=60, verify=False)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  ⚠  Erro na API: {e}")
-            print("  🔄  Tentando fallback via download CSV direto...")
-            return baixar_via_csv(filtro_sigla, debug)
-
-        data = resp.json()
-        if not data.get("success"):
-            print(f"  ⚠  API retornou erro: {data.get('error')}")
-            return baixar_via_csv(filtro_sigla, debug)
-
-        registros = data["result"]["records"]
-        total     = data["result"]["total"]
-
-        if offset == 0:
-            print(f"  ✅ Total de registros (Tarifa de Aplicação): {total:,}")
-
-        todos.extend(registros)
-        offset += PAGE_SIZE
-
-        pct = min(100, len(todos) / max(total, 1) * 100)
-        print(f"  ⏳ Baixados: {len(todos):,}/{total:,} ({pct:.0f}%)", end="\r")
-
-        if len(todos) >= total or not registros:
-            break
-
-    print()  # nova linha após o \r
-
-    if not todos:
-        print("  ⚠  Nenhum registro retornado — tentando CSV direto...")
-        return baixar_via_csv(filtro_sigla, debug)
-
-    df = pd.DataFrame(todos)
-    if debug:
-        print(f"\n  🔍 Colunas disponíveis: {list(df.columns)}")
-        print(f"  🔍 Amostra (3 linhas):\n{df.head(3).to_string()}\n")
-    return df
-
-
-def baixar_via_csv(filtro_sigla=None, debug=False) -> pd.DataFrame:
-    """Fallback: baixa o CSV completo e filtra localmente."""
-    print(f"📡  Baixando CSV completo (~8MB)...")
+def carregar_excel(path: Path, debug=False) -> pd.DataFrame:
+    print(f"📂  Lendo arquivo: {path}")
     try:
-        resp = SESSION.get(CSV_DOWNLOAD, timeout=120, verify=False)
-        resp.raise_for_status()
-        resp.encoding = "utf-8-sig"
-    except requests.RequestException as e:
-        print(f"❌  Falha no download: {e}")
+        df = pd.read_excel(str(path), dtype=str)
+    except Exception as e:
+        print(f"❌  Erro ao ler Excel: {e}")
         sys.exit(1)
 
-    from io import StringIO
-    df = pd.read_csv(StringIO(resp.text), sep=";", dtype=str)
-    print(f"  ✅ CSV baixado: {len(df):,} linhas × {len(df.columns)} colunas")
+    print(f"  ✅ {len(df):,} linhas × {len(df.columns)} colunas")
 
     if debug:
         print(f"  🔍 Colunas: {list(df.columns)}")
         print(f"  🔍 Amostra:\n{df.head(3).to_string()}\n")
 
-    # Filtra base tarifária
-    if "DscBaseTarifaria" in df.columns:
-        df = df[df["DscBaseTarifaria"].str.strip() == "Tarifa de Aplicação"]
-        print(f"  🔽 Após filtro Base Tarifária: {len(df):,} linhas")
-
-    if filtro_sigla and "SigAgente" in df.columns:
-        df = df[df["SigAgente"].str.upper() == filtro_sigla.upper()]
-
     return df
 
 
-# ─── PROCESSAMENTO ────────────────────────────────────────────────────────────
+def processar(df: pd.DataFrame, filtro_sigla=None, debug=False) -> dict:
+    df = df.copy()
 
-def processar_distribuidoras(df: pd.DataFrame, debug=False) -> dict:
-    """
-    Para cada distribuidora:
-      1. Filtra apenas concessionárias
-      2. Seleciona somente a REH mais recente
-      3. Estrutura tarifas por subgrupo / modalidade / posto / classe
-    """
+    # Normaliza nomes de colunas (remove espaços extras)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_sigla = "Sigla"
+    col_reh   = "Resolução ANEEL"
+    col_base  = "Base Tarifária"
+    col_ini   = "Início Vigência"
+    col_fim   = "Fim Vigência"
+    col_sub   = "Subgrupo"
+    col_mod   = "Modalidade"
+    col_cls   = "Classe"
+    col_scls  = "Subclasse"
+    col_det   = "Detalhe"
+    col_ace   = "Acessante"
+    col_post  = "Posto"
+    col_uni   = "Unidade"
+    col_tusd  = "TUSD"
+    col_te    = "TE"
+
+    # ── 1. Remove linhas de metadados ────────────────────────────────────────
+    df[col_sigla] = df[col_sigla].fillna("").astype(str)
+    df = df[df[col_sigla].apply(eh_linha_valida)].copy()
+    print(f"  🔽 Após remover metadados: {len(df):,} linhas")
+
+    # ── 2. Filtra base tarifária ──────────────────────────────────────────────
+    if col_base in df.columns:
+        df = df[df[col_base].fillna("").str.strip() == "Tarifa de Aplicação"]
+        print(f"  🔽 Após filtro Base Tarifária: {len(df):,} linhas")
+
+    # ── 3. Filtro opcional por distribuidora ─────────────────────────────────
+    if filtro_sigla:
+        df = df[df[col_sigla].str.lower() == filtro_sigla.lower()]
+        print(f"  🔽 Após filtro sigla '{filtro_sigla}': {len(df):,} linhas")
+
     if df.empty:
-        print("⚠  DataFrame vazio — nenhum dado para processar.")
+        print("  ⚠  Nenhum dado após filtros.")
         return {}
 
-    # Garante que SigAgente existe
-    if "SigAgente" not in df.columns:
-        print("❌  Coluna 'SigAgente' não encontrada. Verifique o CSV/API.")
-        print(f"   Colunas disponíveis: {list(df.columns)}")
-        sys.exit(1)
+    # ── 4. REH mais recente por distribuidora ─────────────────────────────────
+    df["_reh_sort"] = df[col_reh].apply(normaliza_reh)
+    idx_max = df.groupby(col_sigla)["_reh_sort"].transform("max") == df["_reh_sort"]
+    df = df[idx_max].copy()
+    df.drop(columns=["_reh_sort"], inplace=True)
+    print(f"  🔽 Após seleção da REH mais recente: {len(df):,} linhas")
 
-    df = df.copy()
-    df["SigAgente"] = df["SigAgente"].str.strip().str.upper()
-
-    # ── 1. Filtra concessionárias ────────────────────────────────────────────
-    siglas_todas = df["SigAgente"].unique()
-    siglas_conc  = [s for s in siglas_todas if eh_concessionaria(s)]
-    df = df[df["SigAgente"].isin(siglas_conc)]
-    print(f"  🏢 Concessionárias identificadas: {len(siglas_conc)}")
-
-    # ── 2. Seleciona REH mais recente por distribuidora ───────────────────────
-    if "DscREH" in df.columns:
-        df["_reh_sort"] = df["DscREH"].apply(normaliza_reh)
-
-        # Para cada distribuidora, pega o maior (ano, numero)
-        idx_max_reh = (
-            df.groupby("SigAgente")["_reh_sort"]
-            .transform("max") == df["_reh_sort"]
-        )
-        df = df[idx_max_reh].copy()
-        df.drop(columns=["_reh_sort"], inplace=True)
-        print(f"  📋 Registros após seleção da REH mais recente: {len(df):,}")
-
-    # ── 3. Estrutura resultado ────────────────────────────────────────────────
+    # ── 5. Monta resultado ────────────────────────────────────────────────────
     resultado = {}
 
-    for sigla, grupo in df.groupby("SigAgente"):
-        reh        = grupo["DscREH"].iloc[0] if "DscREH" in grupo else None
-        dt_inicio  = grupo["DatInicioVigencia"].iloc[0] if "DatInicioVigencia" in grupo else None
-        dt_fim     = grupo["DatFimVigencia"].iloc[0]    if "DatFimVigencia"    in grupo else None
-        cnpj       = grupo["NumCNPJDistribuidora"].iloc[0] if "NumCNPJDistribuidora" in grupo else None
+    for sigla, grupo in df.groupby(col_sigla):
+        reh       = grupo[col_reh].iloc[0] if col_reh in grupo else None
+        dt_inicio = grupo[col_ini].iloc[0] if col_ini in grupo else None
+        dt_fim    = grupo[col_fim].iloc[0] if col_fim in grupo else None
+
+        # Normaliza datas
+        for dt in [dt_inicio, dt_fim]:
+            if dt and "00:00:00" in str(dt):
+                dt = str(dt).split(" ")[0]
 
         tarifas = []
         for _, row in grupo.iterrows():
-            tusd = parse_float_br(row.get("VlrTUSD"))
-            te   = parse_float_br(row.get("VlrTE"))
+            tusd_raw = row.get(col_tusd)
+            te_raw   = row.get(col_te)
+            tusd = parse_float_br(tusd_raw)
+            te   = parse_float_br(te_raw)
+
+            # Converte strings de data
+            ini_str = str(row.get(col_ini, "")).split(" ")[0] if row.get(col_ini) else None
+            fim_str = str(row.get(col_fim, "")).split(" ")[0] if row.get(col_fim) else None
 
             tarifas.append({
-                "subgrupo":          row.get("DscSubGrupo", "").strip(),
-                "modalidade":        row.get("DscModalidadeTarifaria", "").strip(),
-                "classe":            row.get("DscClasse", "").strip(),
-                "subclasse":         row.get("DscSubClasse", "").strip(),
-                "detalhe":           row.get("DscDetalhe", "").strip(),
-                "posto_tarifario":   row.get("NomPostoTarifario", "").strip(),
-                "unidade":           row.get("DscUnidadeTerciaria", "").strip(),
-                "agente_acessante":  row.get("SigAgenteAcessante", "").strip(),
-                "vlr_tusd":          tusd,
-                "vlr_te":            te,
-                "vlr_total":         round(tusd + te, 6) if tusd is not None and te is not None else None,
+                "vigencia_inicio": ini_str,
+                "vigencia_fim":    fim_str,
+                "subgrupo":        str(row.get(col_sub,  "") or "").strip(),
+                "modalidade":      str(row.get(col_mod,  "") or "").strip(),
+                "classe":          str(row.get(col_cls,  "") or "").strip(),
+                "subclasse":       str(row.get(col_scls, "") or "").strip(),
+                "detalhe":         str(row.get(col_det,  "") or "").strip(),
+                "acessante":       str(row.get(col_ace,  "") or "").strip(),
+                "posto":           str(row.get(col_post, "") or "").strip(),
+                "unidade":         str(row.get(col_uni,  "") or "").strip(),
+                "vlr_tusd":        tusd,
+                "vlr_te":          te,
+                "vlr_total":       round(tusd + te, 6) if tusd is not None and te is not None else None,
             })
 
         resultado[sigla] = {
             "sigla":           sigla,
-            "cnpj":            cnpj,
             "reh":             reh,
-            "vigencia_inicio": dt_inicio,
-            "vigencia_fim":    dt_fim,
+            "vigencia_inicio": str(dt_inicio).split(" ")[0] if dt_inicio else None,
+            "vigencia_fim":    str(dt_fim).split(" ")[0]    if dt_fim    else None,
             "base_tarifaria":  "Tarifa de Aplicação",
             "tarifas":         tarifas,
             "total_registros": len(tarifas),
@@ -321,123 +196,94 @@ def processar_distribuidoras(df: pd.DataFrame, debug=False) -> dict:
     return resultado
 
 
-# ─── RESUMO ────────────────────────────────────────────────────────────────────
+# ─── RESUMO ───────────────────────────────────────────────────────────────────
 
 def imprimir_resumo(resultado: dict):
-    """Imprime tabela resumida no terminal."""
-    if not resultado:
-        print("  ⚠  Nenhuma distribuidora no resultado.")
-        return
-
     print(f"\n{'─'*70}")
-    print(f"  {'DISTRIBUIDORA':<20} {'REH':<15} {'VIGÊNCIA':>12}  {'REGISTROS':>10}")
+    print(f"  {'DISTRIBUIDORA':<30} {'REH':>6}  {'VIGÊNCIA':>10}  {'REGS':>6}")
     print(f"{'─'*70}")
-
     for sigla, d in sorted(resultado.items()):
-        reh    = str(d.get("reh", "?"))[:14]
-        inicio = str(d.get("vigencia_inicio", "?"))[:10]
-        regs   = d.get("total_registros", 0)
-        print(f"  {sigla:<20} {reh:<15} {inicio:>12}  {regs:>10}")
-
+        reh_num = re.search(r"(\d[\d\.]+)", str(d.get("reh", ""))).group(1)[:8] \
+                  if d.get("reh") else "?"
+        inicio  = str(d.get("vigencia_inicio", "?"))[:10]
+        regs    = d.get("total_registros", 0)
+        print(f"  {sigla:<30} {reh_num:>8}  {inicio:>10}  {regs:>6}")
     print(f"{'─'*70}")
     print(f"  Total: {len(resultado)} distribuidoras\n")
 
 
-def exportar_csv_flat(resultado: dict, path_csv: Path):
-    """Exporta versão flat (uma linha por tarifa) em CSV."""
+def exportar_csv(resultado: dict, path_csv: Path):
     linhas = []
     for sigla, d in resultado.items():
         for t in d.get("tarifas", []):
-            linhas.append({
-                "sigla":           sigla,
-                "cnpj":            d.get("cnpj"),
-                "reh":             d.get("reh"),
-                "vigencia_inicio": d.get("vigencia_inicio"),
-                "vigencia_fim":    d.get("vigencia_fim"),
-                **t,
-            })
-    df_out = pd.DataFrame(linhas)
-    df_out.to_csv(path_csv, index=False, encoding="utf-8-sig", sep=";")
-    print(f"  📄 CSV exportado: {path_csv}  ({len(df_out):,} linhas)")
+            linhas.append({"sigla": sigla, "reh": d.get("reh"), **t})
+    pd.DataFrame(linhas).to_csv(path_csv, index=False, encoding="utf-8-sig", sep=";")
+    print(f"  📄 CSV: {path_csv}  ({len(linhas):,} linhas)")
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Suprime warnings de SSL (servidor ANEEL usa TLS legado)
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
     parser = argparse.ArgumentParser(
-        description="Extrator de Tarifas ANEEL — Base Homologadas (Dados Abertos)"
+        description="Processa o Excel de tarifas ANEEL exportado do portal"
     )
+    parser.add_argument("--input",  default=DEFAULT_INPUT,
+                        help=f"Arquivo Excel de entrada (default: {DEFAULT_INPUT})")
     parser.add_argument("--output", default=DEFAULT_OUTPUT,
-                        help="Arquivo JSON de saída (default: tarifas_aneel_homologadas.json)")
-    parser.add_argument("--csv", action="store_true",
-                        help="Também exporta CSV flat (uma linha por tarifa)")
-    parser.add_argument("--sigla", default=None,
-                        help="Filtra uma única distribuidora (ex: --sigla ENEL-SP)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Mostra amostra dos dados brutos")
+                        help=f"JSON de saída (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("--csv",    action="store_true",
+                        help="Também exporta CSV flat")
+    parser.add_argument("--sigla",  default=None,
+                        help="Filtra uma distribuidora (ex: --sigla 'Enel SP')")
+    parser.add_argument("--debug",  action="store_true")
     args = parser.parse_args()
 
+    in_path  = Path(args.input)
     out_path = Path(args.output)
+
+    if not in_path.exists():
+        print(f"❌  Arquivo não encontrado: {in_path}")
+        print(f"   Baixe o Excel em: https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!")
+        sys.exit(1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║  Extrator de Tarifas ANEEL — Base Homologadas                ║
-║  Fonte: dadosabertos.aneel.gov.br                            ║
+║  Extrator de Tarifas ANEEL — Portal Luz na Tarifa            ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
-    print(f"  Saída JSON: {out_path}")
-    if args.csv:
-        print(f"  Saída CSV:  {out_path.with_suffix('.csv')}")
-    if args.sigla:
-        print(f"  Filtro:     {args.sigla.upper()}")
-    print()
 
-    # ── Download ─────────────────────────────────────────────────────────────
-    df = baixar_via_api_paginada(filtro_sigla=args.sigla, debug=args.debug)
+    df       = carregar_excel(in_path, debug=args.debug)
+    print("\n🔄  Processando...")
+    resultado = processar(df, filtro_sigla=args.sigla, debug=args.debug)
 
-    if df.empty:
-        print("❌  Nenhum dado retornado.")
-        sys.exit(1)
-
-    # ── Processamento ─────────────────────────────────────────────────────────
-    print("\n🔄  Processando filtros (concessionárias + REH mais recente)...")
-    resultado = processar_distribuidoras(df, debug=args.debug)
-
-    # ── Resumo ────────────────────────────────────────────────────────────────
     imprimir_resumo(resultado)
 
-    # ── Salva JSON ────────────────────────────────────────────────────────────
     envelope = {
-        "gerado_em":     datetime.now(timezone.utc).isoformat(),
-        "fonte":         "Dados Abertos ANEEL — Tarifas Homologadas Distribuidoras",
-        "url_fonte":     "https://dadosabertos.aneel.gov.br/dataset/tarifas-distribuidoras-energia-eletrica",
-        "resource_id":   RESOURCE_ID,
-        "filtros":       {
-            "tipo_outorga":   "Concessionária",
-            "base_tarifaria": "Tarifa de Aplicação",
-            "reh":            "Mais recente por distribuidora",
+        "gerado_em":            datetime.now(timezone.utc).isoformat(),
+        "fonte":                "Portal Luz na Tarifa — ANEEL",
+        "url_fonte":            "https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!",
+        "arquivo_origem":       in_path.name,
+        "filtros": {
+            "base_tarifaria":   "Tarifa de Aplicação",
+            "reh":              "Mais recente por distribuidora",
         },
         "total_distribuidoras": len(resultado),
-        "distribuidoras": resultado,
+        "distribuidoras":       resultado,
     }
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(envelope, f, ensure_ascii=False, indent=2, default=str)
 
-    print(f"✅  JSON salvo: {out_path}  ({out_path.stat().st_size / 1024:.1f} KB)")
+    print(f"✅  JSON: {out_path}  ({out_path.stat().st_size / 1024:.1f} KB)")
 
-    # ── Exporta CSV flat (opcional) ───────────────────────────────────────────
     if args.csv:
-        exportar_csv_flat(resultado, out_path.with_suffix(".csv"))
+        exportar_csv(resultado, out_path.with_suffix(".csv"))
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║  Concluído! {len(resultado)} distribuidoras extraídas         
-║  → {out_path}
+║  Concluído! {len(resultado)} distribuidoras extraídas
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
