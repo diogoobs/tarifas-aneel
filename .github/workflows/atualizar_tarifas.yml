@@ -1,73 +1,70 @@
-name: Publicar Tarifas ANEEL
-
-# Este workflow NÃO baixa dados da ANEEL.
-# O servidor da ANEEL bloqueia IPs de data center (AWS/GitHub).
-#
-# FLUXO CORRETO:
-#   1. Você roda o script localmente no Mac
-#   2. Faz git push do JSON gerado
-#   3. Este workflow valida e registra a atualização
+name: Atualizar Tarifas ANEEL
 
 on:
-  push:
-    paths:
-      - "data/tarifas_aneel.json"   # dispara só quando o JSON for atualizado
-  workflow_dispatch:                 # permite rodar manualmente para validar
+  schedule:
+    - cron: "0 9 * * 1"   # toda segunda-feira às 06:00 Brasília (09:00 UTC)
+  workflow_dispatch:        # permite rodar manualmente
 
 jobs:
-  validar:
+  extrair:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout do repositório
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      - name: Instalar dependências
-        run: pip install pandas
+      - name: Instalar dependências Python
+        run: pip install playwright pandas openpyxl
 
-      - name: Validar JSON gerado
+      - name: Instalar Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Rodar extrator
+        run: |
+          python scripts/extrator_playwright.py \
+            --output data/tarifas_aneel.json \
+            --headless
+        timeout-minutes: 10
+
+      - name: Verificar resultado
         run: |
           python3 - << 'PYEOF'
-          import json, sys, pandas as pd
+          import json, sys
           from pathlib import Path
 
           path = Path("data/tarifas_aneel.json")
-          if not path.exists():
-              print("❌ data/tarifas_aneel.json não encontrado")
-              sys.exit(1)
-
-          with open(path, encoding="utf-8") as f:
-              data = json.load(f)
-
-          distribuidoras = data.get("distribuidoras", {})
-          total = len(distribuidoras)
+          data = json.loads(path.read_text(encoding="utf-8"))
+          total = len(data.get("distribuidoras", {}))
 
           if total == 0:
-              print("❌ Nenhuma distribuidora no JSON")
+              print("❌ Nenhuma distribuidora extraída")
               sys.exit(1)
 
-          print(f"✅ JSON válido — {total} distribuidoras")
-          print(f"   Gerado em: {data.get('gerado_em', '?')}")
-          print(f"   Base: {data.get('filtros', {}).get('base_tarifaria', '?')}")
-
-          for sigla, d in sorted(distribuidoras.items()):
-              regs = d.get("total_registros", 0)
-              reh  = d.get("reh", "?")
-              print(f"   {sigla:<20} REH {reh:<15} {regs:>6} registros")
+          print(f"✅ {total} distribuidoras extraídas")
+          for sigla, d in sorted(data["distribuidoras"].items()):
+              print(f"   {sigla:<28} REH {str(d.get('reh','?'))[:20]}  {d.get('total_registros',0):>6} regs")
           PYEOF
 
-      - name: Registrar atualização no summary
+      - name: Commitar se houve mudança
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/tarifas_aneel.json
+          git diff --staged --quiet && echo "Sem mudanças." || (
+            git commit -m "chore: atualiza tarifas ANEEL $(date -u +%Y-%m-%d)"
+            git push
+          )
+
+      - name: Resumo
         run: |
           echo "## ✅ Tarifas ANEEL atualizadas" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Data:** $(date -u +'%d/%m/%Y %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**URL pública dos dados:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`https://raw.githubusercontent.com/diogoobs/tarifas-aneel/main/data/tarifas_aneel.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** \`https://raw.githubusercontent.com/diogoobs/tarifas-aneel/main/data/tarifas_aneel.json\`" >> $GITHUB_STEP_SUMMARY
