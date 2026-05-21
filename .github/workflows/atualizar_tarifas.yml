@@ -2,8 +2,8 @@ name: Atualizar Tarifas ANEEL
 
 on:
   schedule:
-    - cron: "0 9 * * 1"   # toda segunda-feira às 06:00 Brasília (09:00 UTC)
-  workflow_dispatch:        # permite rodar manualmente
+    - cron: "0 9 * * 1"   # toda segunda-feira às 06:00 Brasília
+  workflow_dispatch:
 
 jobs:
   extrair:
@@ -12,53 +12,32 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Instalar dependências Python
-        run: pip install playwright pandas openpyxl
+      - name: Instalar dependências
+        run: pip install requests pandas
 
-      - name: Instalar Chromium
-        run: playwright install chromium --with-deps
-
-      - name: Diagnóstico de rede
-        run: |
-          echo "=== portalrelatorios ==="
-          curl -I --max-time 15 https://portalrelatorios.aneel.gov.br || true
-          echo "=== dadosabertos ==="
-          curl -I --max-time 15 https://dadosabertos.aneel.gov.br || true
-
-      - name: Rodar extrator
-        run: |
-          python scripts/extrator_playwright.py \
-            --output data/tarifas_aneel.json \
-            --headless
-        timeout-minutes: 10
+      - name: Extrair tarifas via proxy
+        env:
+          PROXY_URL:   ${{ secrets.PROXY_URL }}
+          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
+        run: python scripts/extrator_tarifas_aneel.py --output data/tarifas_aneel.json
+        timeout-minutes: 5
 
       - name: Verificar resultado
         run: |
-          python3 - << 'PYEOF'
-          import json, sys
-          from pathlib import Path
-
-          path = Path("data/tarifas_aneel.json")
-          data = json.loads(path.read_text(encoding="utf-8"))
-          total = len(data.get("distribuidoras", {}))
-
-          if total == 0:
-              print("❌ Nenhuma distribuidora extraída")
-              sys.exit(1)
-
-          print(f"✅ {total} distribuidoras extraídas")
-          for sigla, d in sorted(data["distribuidoras"].items()):
-              print(f"   {sigla:<28} REH {str(d.get('reh','?'))[:20]}  {d.get('total_registros',0):>6} regs")
-          PYEOF
+          python3 -c "
+          import json; from pathlib import Path
+          d = json.loads(Path('data/tarifas_aneel.json').read_text())
+          t = len(d.get('distribuidoras', {}))
+          print(f'✅ {t} distribuidoras' if t > 0 else '❌ vazio')
+          __import__('sys').exit(0 if t > 0 else 1)
+          "
 
       - name: Commitar se houve mudança
         run: |
@@ -69,9 +48,3 @@ jobs:
             git commit -m "chore: atualiza tarifas ANEEL $(date -u +%Y-%m-%d)"
             git push
           )
-
-      - name: Resumo
-        run: |
-          echo "## ✅ Tarifas ANEEL atualizadas" >> $GITHUB_STEP_SUMMARY
-          echo "**Data:** $(date -u +'%d/%m/%Y %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "**URL:** \`https://raw.githubusercontent.com/diogoobs/tarifas-aneel/main/data/tarifas_aneel.json\`" >> $GITHUB_STEP_SUMMARY

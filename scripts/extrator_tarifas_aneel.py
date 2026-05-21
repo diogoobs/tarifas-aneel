@@ -1,193 +1,164 @@
 #!/usr/bin/env python3
 """
-Extrator de Tarifas ANEEL — Base de Dados Tarifas Homologadas
-=============================================================
-Fonte: https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!
+Extrator de Tarifas ANEEL — via Cloudflare Worker Proxy
+=========================================================
+Baixa o CSV de tarifas via proxy na Cloudflare (contorna bloqueio de IP).
 
-COMO OBTER O ARQUIVO:
-    1. Acesse https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!
-    2. Aplique os filtros:
-       - Tipo de Outorga: Concessionária
-       - Base Tarifária: Tarifa de Aplicação
-       - Ano, Mês: mais recente disponível
-    3. Clique em "Baixar dados" → "Dados com layout atual" → xlsx → Exportar
-    4. Salve o arquivo como data.xlsx na mesma pasta deste script
+INSTALAÇÃO:
+    pip install requests pandas openpyxl
 
 USO:
-    python3 extrator_tarifas_aneel.py                        # processa data.xlsx
-    python3 extrator_tarifas_aneel.py --input meu_arquivo.xlsx
-    python3 extrator_tarifas_aneel.py --output tarifas.json --csv
-    python3 extrator_tarifas_aneel.py --sigla "Enel SP"      # só uma distribuidora
+    python3 extrator_tarifas_aneel.py
+    python3 extrator_tarifas_aneel.py --sigla "Enel SP"
+    python3 extrator_tarifas_aneel.py --debug
 
-FILTROS APLICADOS:
-    • Remove linhas de metadados/filtros embutidas no Excel
-    • Mantém apenas Base Tarifária = "Tarifa de Aplicação"
-    • Seleciona a REH mais recente por distribuidora
+VARIÁVEIS DE AMBIENTE (obrigatórias no GitHub Actions):
+    PROXY_URL    URL do Cloudflare Worker (ex: https://aneel-proxy.SEU_USER.workers.dev)
+    PROXY_TOKEN  Token de segurança configurado no Worker
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("❌  Execute: pip install requests"); sys.exit(1)
 
 try:
     import pandas as pd
 except ImportError:
-    print("❌  Execute: pip install pandas openpyxl")
-    sys.exit(1)
+    print("❌  Execute: pip install pandas"); sys.exit(1)
 
-DEFAULT_INPUT  = "data.xlsx"
 DEFAULT_OUTPUT = "data/tarifas_aneel.json"
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def parse_float_br(s):
-    if s is None or str(s).strip() in ("", "-", "nan", "0"):
+    if s is None or str(s).strip() in ("", "-", "nan"):
         return None
     try:
         return float(str(s).replace(".", "").replace(",", "."))
     except ValueError:
         return None
 
-
 def normaliza_reh(reh: str) -> tuple:
-    """Extrai (ano, numero) de 'REH Nº 3.477, DE 21 DE MARÇO DE 2025' para ordenação."""
     m = re.search(r"(\d[\d\.]+).*?(\d{4})\s*$", str(reh).strip())
-    if not m:
-        return (0, 0)
-    num = int(m.group(1).replace(".", ""))
-    ano = int(m.group(2))
-    return (ano, num)
-
+    if not m: return (0, 0)
+    return (int(m.group(2)), int(m.group(1).replace(".", "")))
 
 def eh_linha_valida(sigla: str) -> bool:
-    """Descarta linhas de metadados embutidas no Excel do Power BI."""
-    if not sigla or not str(sigla).strip():
-        return False
-    s = str(sigla).strip()
-    # Linhas de metadados contêm frases dos filtros aplicados
-    for termo in ["Filtros", "Base Tarifária", "Tipo de Outorga",
-                  "Ano é", "Flag é", "Em branco"]:
-        if termo in s:
-            return False
+    if not sigla or not str(sigla).strip(): return False
+    for termo in ["Filtros", "Base Tarifária", "Tipo de Outorga", "Ano é", "Flag é"]:
+        if termo in str(sigla): return False
     return True
 
 
-# ─── LEITURA E PROCESSAMENTO ──────────────────────────────────────────────────
+# ─── DOWNLOAD VIA PROXY ───────────────────────────────────────────────────────
 
-def carregar_excel(path: Path, debug=False) -> pd.DataFrame:
-    print(f"📂  Lendo arquivo: {path}")
+def baixar_csv(proxy_url: str, proxy_token: str, debug=False) -> str:
+    """Baixa o CSV via Cloudflare Worker proxy."""
+    url = f"{proxy_url.rstrip('/')}/csv"
+    headers = {"X-Proxy-Token": proxy_token}
+
+    print(f"📡  Baixando via proxy: {proxy_url}")
     try:
-        df = pd.read_excel(str(path), dtype=str)
-    except Exception as e:
-        print(f"❌  Erro ao ler Excel: {e}")
-        sys.exit(1)
+        resp = requests.get(url, headers=headers, timeout=60)
+        if resp.status_code == 401:
+            print("❌  Token inválido — verifique PROXY_TOKEN"); sys.exit(1)
+        resp.raise_for_status()
+        print(f"  ✅ CSV baixado: {len(resp.content)/1024:.0f} KB")
+        return resp.text
+    except requests.RequestException as e:
+        print(f"❌  Erro no proxy: {e}"); sys.exit(1)
 
+
+# ─── PROCESSAMENTO ────────────────────────────────────────────────────────────
+
+def processar(csv_text: str, filtro_sigla=None) -> dict:
+    df = pd.read_csv(StringIO(csv_text), sep=";", dtype=str)
     print(f"  ✅ {len(df):,} linhas × {len(df.columns)} colunas")
 
-    if debug:
-        print(f"  🔍 Colunas: {list(df.columns)}")
-        print(f"  🔍 Amostra:\n{df.head(3).to_string()}\n")
+    # Normaliza colunas
+    df.columns = [c.strip() for c in df.columns]
 
-    return df
+    # Mapeamento de colunas (CSV usa nomes em português)
+    col_map = {
+        "sigla":   next((c for c in df.columns if "sigla" in c.lower() or "agente" in c.lower()), None),
+        "reh":     next((c for c in df.columns if "reh" in c.lower() or "resolucao" in c.lower() or "resolução" in c.lower()), None),
+        "base":    next((c for c in df.columns if "base" in c.lower()), None),
+        "inicio":  next((c for c in df.columns if "inicio" in c.lower() or "início" in c.lower()), None),
+        "fim":     next((c for c in df.columns if "fim" in c.lower()), None),
+        "subgrupo": next((c for c in df.columns if "subgrupo" in c.lower()), None),
+        "modal":   next((c for c in df.columns if "modalidade" in c.lower()), None),
+        "classe":  next((c for c in df.columns if "classe" in c.lower() and "sub" not in c.lower()), None),
+        "subclasse": next((c for c in df.columns if "subclasse" in c.lower()), None),
+        "detalhe": next((c for c in df.columns if "detalhe" in c.lower()), None),
+        "acesante": next((c for c in df.columns if "acess" in c.lower()), None),
+        "posto":   next((c for c in df.columns if "posto" in c.lower()), None),
+        "unidade": next((c for c in df.columns if "unidade" in c.lower()), None),
+        "tusd":    next((c for c in df.columns if "tusd" in c.lower()), None),
+        "te":      next((c for c in df.columns if c.lower() == "te" or "vlrte" in c.lower()), None),
+    }
 
-
-def processar(df: pd.DataFrame, filtro_sigla=None, debug=False) -> dict:
-    df = df.copy()
-
-    # Normaliza nomes de colunas (remove espaços extras)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    col_sigla = "Sigla"
-    col_reh   = "Resolução ANEEL"
-    col_base  = "Base Tarifária"
-    col_ini   = "Início Vigência"
-    col_fim   = "Fim Vigência"
-    col_sub   = "Subgrupo"
-    col_mod   = "Modalidade"
-    col_cls   = "Classe"
-    col_scls  = "Subclasse"
-    col_det   = "Detalhe"
-    col_ace   = "Acessante"
-    col_post  = "Posto"
-    col_uni   = "Unidade"
-    col_tusd  = "TUSD"
-    col_te    = "TE"
-
-    # ── 1. Remove linhas de metadados ────────────────────────────────────────
+    col_sigla = col_map["sigla"] or "SigAgente"
     df[col_sigla] = df[col_sigla].fillna("").astype(str)
     df = df[df[col_sigla].apply(eh_linha_valida)].copy()
-    print(f"  🔽 Após remover metadados: {len(df):,} linhas")
 
-    # ── 2. Filtra base tarifária ──────────────────────────────────────────────
-    if col_base in df.columns:
-        df = df[df[col_base].fillna("").str.strip() == "Tarifa de Aplicação"]
-        print(f"  🔽 Após filtro Base Tarifária: {len(df):,} linhas")
+    # Filtra base tarifária
+    if col_map["base"]:
+        df = df[df[col_map["base"]].fillna("").str.strip() == "Tarifa de Aplicação"]
 
-    # ── 3. Filtro opcional por distribuidora ─────────────────────────────────
     if filtro_sigla:
         df = df[df[col_sigla].str.lower() == filtro_sigla.lower()]
-        print(f"  🔽 Após filtro sigla '{filtro_sigla}': {len(df):,} linhas")
 
-    if df.empty:
-        print("  ⚠  Nenhum dado após filtros.")
-        return {}
+    print(f"  🔽 Após filtros: {len(df):,} linhas")
 
-    # ── 4. REH mais recente por distribuidora ─────────────────────────────────
-    df["_reh_sort"] = df[col_reh].apply(normaliza_reh)
-    idx_max = df.groupby(col_sigla)["_reh_sort"].transform("max") == df["_reh_sort"]
-    df = df[idx_max].copy()
-    df.drop(columns=["_reh_sort"], inplace=True)
-    print(f"  🔽 Após seleção da REH mais recente: {len(df):,} linhas")
+    # REH mais recente
+    col_reh = col_map["reh"] or "DscREH"
+    if col_reh in df.columns:
+        df["_sort"] = df[col_reh].apply(normaliza_reh)
+        df = df[df.groupby(col_sigla)["_sort"].transform("max") == df["_sort"]].copy()
+        df.drop(columns=["_sort"], inplace=True)
 
-    # ── 5. Monta resultado ────────────────────────────────────────────────────
+    print(f"  🔽 Após REH mais recente: {len(df):,} linhas")
+
     resultado = {}
-
     for sigla, grupo in df.groupby(col_sigla):
-        reh       = grupo[col_reh].iloc[0] if col_reh in grupo else None
-        dt_inicio = grupo[col_ini].iloc[0] if col_ini in grupo else None
-        dt_fim    = grupo[col_fim].iloc[0] if col_fim in grupo else None
-
-        # Normaliza datas
-        for dt in [dt_inicio, dt_fim]:
-            if dt and "00:00:00" in str(dt):
-                dt = str(dt).split(" ")[0]
+        reh = grupo[col_reh].iloc[0] if col_reh in grupo else None
+        ini = grupo[col_map["inicio"]].iloc[0] if col_map["inicio"] else None
+        fim = grupo[col_map["fim"]].iloc[0] if col_map["fim"] else None
 
         tarifas = []
         for _, row in grupo.iterrows():
-            tusd_raw = row.get(col_tusd)
-            te_raw   = row.get(col_te)
-            tusd = parse_float_br(tusd_raw)
-            te   = parse_float_br(te_raw)
-
-            # Converte strings de data
-            ini_str = str(row.get(col_ini, "")).split(" ")[0] if row.get(col_ini) else None
-            fim_str = str(row.get(col_fim, "")).split(" ")[0] if row.get(col_fim) else None
-
+            tusd = parse_float_br(row.get(col_map["tusd"] or "VlrTUSD"))
+            te   = parse_float_br(row.get(col_map["te"]   or "VlrTE"))
             tarifas.append({
-                "vigencia_inicio": ini_str,
-                "vigencia_fim":    fim_str,
-                "subgrupo":        str(row.get(col_sub,  "") or "").strip(),
-                "modalidade":      str(row.get(col_mod,  "") or "").strip(),
-                "classe":          str(row.get(col_cls,  "") or "").strip(),
-                "subclasse":       str(row.get(col_scls, "") or "").strip(),
-                "detalhe":         str(row.get(col_det,  "") or "").strip(),
-                "acessante":       str(row.get(col_ace,  "") or "").strip(),
-                "posto":           str(row.get(col_post, "") or "").strip(),
-                "unidade":         str(row.get(col_uni,  "") or "").strip(),
-                "vlr_tusd":        tusd,
-                "vlr_te":          te,
-                "vlr_total":       round(tusd + te, 6) if tusd is not None and te is not None else None,
+                "subgrupo":   str(row.get(col_map["subgrupo"] or "", "") or "").strip(),
+                "modalidade": str(row.get(col_map["modal"]    or "", "") or "").strip(),
+                "classe":     str(row.get(col_map["classe"]   or "", "") or "").strip(),
+                "subclasse":  str(row.get(col_map["subclasse"]or "", "") or "").strip(),
+                "detalhe":    str(row.get(col_map["detalhe"]  or "", "") or "").strip(),
+                "acessante":  str(row.get(col_map["acesante"] or "", "") or "").strip(),
+                "posto":      str(row.get(col_map["posto"]    or "", "") or "").strip(),
+                "unidade":    str(row.get(col_map["unidade"]  or "", "") or "").strip(),
+                "vlr_tusd":   tusd,
+                "vlr_te":     te,
+                "vlr_total":  round(tusd + te, 6) if tusd is not None and te is not None else None,
             })
 
         resultado[sigla] = {
             "sigla":           sigla,
-            "reh":             reh,
-            "vigencia_inicio": str(dt_inicio).split(" ")[0] if dt_inicio else None,
-            "vigencia_fim":    str(dt_fim).split(" ")[0]    if dt_fim    else None,
+            "reh":             str(reh) if reh else None,
+            "vigencia_inicio": str(ini).split(" ")[0] if ini else None,
+            "vigencia_fim":    str(fim).split(" ")[0] if fim else None,
             "base_tarifaria":  "Tarifa de Aplicação",
             "tarifas":         tarifas,
             "total_registros": len(tarifas),
@@ -196,75 +167,46 @@ def processar(df: pd.DataFrame, filtro_sigla=None, debug=False) -> dict:
     return resultado
 
 
-# ─── RESUMO ───────────────────────────────────────────────────────────────────
-
-def imprimir_resumo(resultado: dict):
-    print(f"\n{'─'*70}")
-    print(f"  {'DISTRIBUIDORA':<30} {'REH':>6}  {'VIGÊNCIA':>10}  {'REGS':>6}")
-    print(f"{'─'*70}")
-    for sigla, d in sorted(resultado.items()):
-        reh_num = re.search(r"(\d[\d\.]+)", str(d.get("reh", ""))).group(1)[:8] \
-                  if d.get("reh") else "?"
-        inicio  = str(d.get("vigencia_inicio", "?"))[:10]
-        regs    = d.get("total_registros", 0)
-        print(f"  {sigla:<30} {reh_num:>8}  {inicio:>10}  {regs:>6}")
-    print(f"{'─'*70}")
-    print(f"  Total: {len(resultado)} distribuidoras\n")
-
-
-def exportar_csv(resultado: dict, path_csv: Path):
-    linhas = []
-    for sigla, d in resultado.items():
-        for t in d.get("tarifas", []):
-            linhas.append({"sigla": sigla, "reh": d.get("reh"), **t})
-    pd.DataFrame(linhas).to_csv(path_csv, index=False, encoding="utf-8-sig", sep=";")
-    print(f"  📄 CSV: {path_csv}  ({len(linhas):,} linhas)")
-
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Processa o Excel de tarifas ANEEL exportado do portal"
-    )
-    parser.add_argument("--input",  default=DEFAULT_INPUT,
-                        help=f"Arquivo Excel de entrada (default: {DEFAULT_INPUT})")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT,
-                        help=f"JSON de saída (default: {DEFAULT_OUTPUT})")
-    parser.add_argument("--csv",    action="store_true",
-                        help="Também exporta CSV flat")
-    parser.add_argument("--sigla",  default=None,
-                        help="Filtra uma distribuidora (ex: --sigla 'Enel SP')")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument("--sigla",  default=None)
     parser.add_argument("--debug",  action="store_true")
     args = parser.parse_args()
 
-    in_path  = Path(args.input)
-    out_path = Path(args.output)
+    proxy_url   = os.environ.get("PROXY_URL",   "").strip()
+    proxy_token = os.environ.get("PROXY_TOKEN", "").strip()
 
-    if not in_path.exists():
-        print(f"❌  Arquivo não encontrado: {in_path}")
-        print(f"   Baixe o Excel em: https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!")
+    if not proxy_url or not proxy_token:
+        print("❌  Defina PROXY_URL e PROXY_TOKEN nas variáveis de ambiente")
+        print("   No GitHub Actions: Settings → Secrets → Actions")
         sys.exit(1)
 
+    out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║  Extrator de Tarifas ANEEL — Portal Luz na Tarifa            ║
+║  Extrator de Tarifas ANEEL — via Cloudflare Proxy            ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
-    df       = carregar_excel(in_path, debug=args.debug)
-    print("\n🔄  Processando...")
-    resultado = processar(df, filtro_sigla=args.sigla, debug=args.debug)
+    csv_text  = baixar_csv(proxy_url, proxy_token, debug=args.debug)
+    resultado = processar(csv_text, filtro_sigla=args.sigla)
 
-    imprimir_resumo(resultado)
+    # Resumo
+    print(f"\n{'─'*65}")
+    for sigla, d in sorted(resultado.items()):
+        print(f"  {sigla:<28} {str(d.get('reh','?'))[:20]}  {d.get('total_registros',0):>6}")
+    print(f"{'─'*65}")
+    print(f"  Total: {len(resultado)} distribuidoras\n")
 
     envelope = {
         "gerado_em":            datetime.now(timezone.utc).isoformat(),
-        "fonte":                "Portal Luz na Tarifa — ANEEL",
-        "url_fonte":            "https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!",
-        "arquivo_origem":       in_path.name,
+        "fonte":                "Dados Abertos ANEEL via Cloudflare Proxy",
+        "url_fonte":            "https://dadosabertos.aneel.gov.br/dataset/tarifas-distribuidoras-energia-eletrica",
         "filtros": {
             "base_tarifaria":   "Tarifa de Aplicação",
             "reh":              "Mais recente por distribuidora",
@@ -276,17 +218,7 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(envelope, f, ensure_ascii=False, indent=2, default=str)
 
-    print(f"✅  JSON: {out_path}  ({out_path.stat().st_size / 1024:.1f} KB)")
-
-    if args.csv:
-        exportar_csv(resultado, out_path.with_suffix(".csv"))
-
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║  Concluído! {len(resultado)} distribuidoras extraídas
-╚══════════════════════════════════════════════════════════════╝
-""")
-
+    print(f"✅  {len(resultado)} distribuidoras → {out_path}  ({out_path.stat().st_size/1024:.0f} KB)")
 
 if __name__ == "__main__":
     main()
