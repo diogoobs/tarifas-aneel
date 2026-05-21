@@ -1,18 +1,24 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────
-# atualizar.sh — Extrai tarifas da ANEEL e envia para o GitHub
+# ─────────────────────────────────────────────────────────────────────────────
+# atualizar.sh — Processa o Excel da ANEEL e publica no GitHub
+#
+# ANTES DE RODAR:
+#   1. Acesse https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!
+#   2. Filtros: Tipo Outorga=Concessionária | Base Tarifária=Tarifa de Aplicação
+#              Ano/Mês=mais recente disponível
+#   3. Clique "Baixar dados" → "Dados com layout atual" → xlsx → Exportar
+#   4. Salve o arquivo como data.xlsx nesta pasta
 #
 # USO:
-#   ./atualizar.sh           # extrai todas as distribuidoras
-#   ./atualizar.sh ENEL-SP   # extrai apenas uma distribuidora
-# ─────────────────────────────────────────────────────────────
+#   ./atualizar.sh              # processa data.xlsx
+#   ./atualizar.sh outro.xlsx   # processa outro arquivo
+# ─────────────────────────────────────────────────────────────────────────────
 
 set -e
+REPO_DIR="/Users/diogosilva/Documents/Claude/Tarifa Justa/tarifas-aneel"
+cd "$REPO_DIR"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
-SIGLA="${1:-}"
+XLSX="${1:-data.xlsx}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
@@ -20,34 +26,42 @@ echo "║  Tarifa Justa — Atualização de Tarifas ANEEL         ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
-# ── 1. Verifica dependências ──────────────────────────────────
-echo "🔍  Verificando dependências..."
-python3 -m pip install -q requests pandas urllib3
-echo "   ✅ OK"
-
-# ── 2. Roda o extrator ────────────────────────────────────────
-echo ""
-if [ -n "$SIGLA" ]; then
-    echo "🚀  Extraindo distribuidora: $SIGLA"
-    python3 scripts/extrator_tarifas_aneel.py \
-        --output data/tarifas_aneel.json \
-        --csv \
-        --sigla "$SIGLA"
-else
-    echo "🚀  Extraindo todas as distribuidoras..."
-    python3 scripts/extrator_tarifas_aneel.py \
-        --output data/tarifas_aneel.json \
-        --csv
+# ── 1. Verifica arquivo ───────────────────────────────────────
+if [ ! -f "$XLSX" ]; then
+    echo "❌  Arquivo não encontrado: $XLSX"
+    echo ""
+    echo "   Baixe o Excel em:"
+    echo "   https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas#!"
+    echo ""
+    echo "   Filtros: Tipo Outorga=Concessionária"
+    echo "            Base Tarifária=Tarifa de Aplicação"
+    echo "            Ano/Mês=mais recente"
+    echo ""
+    echo "   Salve como: $REPO_DIR/$XLSX"
+    exit 1
 fi
 
-# ── 3. Verifica se houve mudança ──────────────────────────────
+# ── 2. Instala dependências ───────────────────────────────────
+echo "🔍  Verificando dependências..."
+python3 -m pip install -q pandas openpyxl
+echo "   ✅ OK"
+echo ""
+
+# ── 3. Processa o Excel ───────────────────────────────────────
+echo "🚀  Processando $XLSX..."
+python3 scripts/extrator_tarifas_aneel.py \
+    --input  "$XLSX" \
+    --output data/tarifas_aneel.json \
+    --csv
+
+# ── 4. Verifica mudanças ──────────────────────────────────────
 echo ""
 if git diff --quiet data/; then
     echo "ℹ️   Dados sem alteração — nenhum commit necessário."
     exit 0
 fi
 
-# ── 4. Commita e envia ────────────────────────────────────────
+# ── 5. Commita e envia ────────────────────────────────────────
 DATA=$(date +%Y-%m-%d)
 echo "📤  Enviando para o GitHub..."
 git add data/tarifas_aneel.json data/tarifas_aneel.csv
