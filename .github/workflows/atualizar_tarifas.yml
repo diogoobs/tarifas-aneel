@@ -1,0 +1,73 @@
+name: Publicar Tarifas ANEEL
+
+# Este workflow NÃO baixa dados da ANEEL.
+# O servidor da ANEEL bloqueia IPs de data center (AWS/GitHub).
+#
+# FLUXO CORRETO:
+#   1. Você roda o script localmente no Mac
+#   2. Faz git push do JSON gerado
+#   3. Este workflow valida e registra a atualização
+
+on:
+  push:
+    paths:
+      - "data/tarifas_aneel.json"   # dispara só quando o JSON for atualizado
+  workflow_dispatch:                 # permite rodar manualmente para validar
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install pandas
+
+      - name: Validar JSON gerado
+        run: |
+          python3 - << 'PYEOF'
+          import json, sys, pandas as pd
+          from pathlib import Path
+
+          path = Path("data/tarifas_aneel.json")
+          if not path.exists():
+              print("❌ data/tarifas_aneel.json não encontrado")
+              sys.exit(1)
+
+          with open(path, encoding="utf-8") as f:
+              data = json.load(f)
+
+          distribuidoras = data.get("distribuidoras", {})
+          total = len(distribuidoras)
+
+          if total == 0:
+              print("❌ Nenhuma distribuidora no JSON")
+              sys.exit(1)
+
+          print(f"✅ JSON válido — {total} distribuidoras")
+          print(f"   Gerado em: {data.get('gerado_em', '?')}")
+          print(f"   Base: {data.get('filtros', {}).get('base_tarifaria', '?')}")
+
+          for sigla, d in sorted(distribuidoras.items()):
+              regs = d.get("total_registros", 0)
+              reh  = d.get("reh", "?")
+              print(f"   {sigla:<20} REH {reh:<15} {regs:>6} registros")
+          PYEOF
+
+      - name: Registrar atualização no summary
+        run: |
+          echo "## ✅ Tarifas ANEEL atualizadas" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Data:** $(date -u +'%d/%m/%Y %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL pública dos dados:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://raw.githubusercontent.com/diogoobs/tarifas-aneel/main/data/tarifas_aneel.json\`" >> $GITHUB_STEP_SUMMARY

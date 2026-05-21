@@ -1,0 +1,7 @@
+{
+  "gerado_em": null,
+  "fonte": "Dados Abertos ANEEL — Tarifas Homologadas Distribuidoras",
+  "url_fonte": "https://dadosabertos.aneel.gov.br/dataset/tarifas-distribuidoras-energia-eletrica",
+  "nota": "Arquivo gerado automaticamente pelo GitHub Actions. Execute o workflow para popular os dados.",
+  "distribuidoras": {}
+}
