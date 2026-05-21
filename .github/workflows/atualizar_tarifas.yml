@@ -2,7 +2,7 @@ name: Atualizar Tarifas ANEEL
 
 on:
   schedule:
-    - cron: "0 9 * * 1"   # toda segunda-feira às 06:00 Brasília
+    - cron: "0 9 * * 1"
   workflow_dispatch:
 
 jobs:
@@ -14,20 +14,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Testa acesso ao portal
+        run: |
+          echo "=== Teste de conectividade ==="
+          curl -I --max-time 15 https://portalrelatorios.aneel.gov.br/luznatarifa/basestarifas || true
+          echo "=== Resultado ==="
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Instalar dependências
-        run: pip install requests pandas
+        run: pip install playwright pandas openpyxl && playwright install chromium --with-deps
 
-      - name: Extrair tarifas via proxy
-        env:
-          PROXY_URL:   ${{ secrets.PROXY_URL }}
-          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
-        run: python scripts/extrator_tarifas_aneel.py --output data/tarifas_aneel.json
-        timeout-minutes: 5
+      - name: Extrair tarifas via Playwright
+        run: python scripts/extrator_playwright.py --output data/tarifas_aneel.json --headless
+        timeout-minutes: 8
 
       - name: Verificar resultado
         run: |
