@@ -27,6 +27,13 @@ jobs:
       - name: Instalar Chromium
         run: playwright install chromium --with-deps
 
+      - name: Diagnóstico de rede
+        run: |
+          echo "=== portalrelatorios ==="
+          curl -I --max-time 15 https://portalrelatorios.aneel.gov.br || true
+          echo "=== dadosabertos ==="
+          curl -I --max-time 15 https://dadosabertos.aneel.gov.br || true
+
       - name: Rodar extrator
         run: |
           python scripts/extrator_playwright.py \
