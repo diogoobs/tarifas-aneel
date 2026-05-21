@@ -2,116 +2,136 @@
 """
 Extrator de Horários dos Postos Tarifários — ANEEL
 ===================================================
-Fonte: https://app.powerbi.com/view?r=eyJrIjoiZTQyNGM4ZWItYzI2ZC00YmU0...
-       (Dashboard "Consulte aqui os postos tarifários das distribuidoras")
-
-Lê os horários de cada distribuidora (Intermediário 1, Ponta, Intermediário 2)
-e os integra ao tarifas_aneel.json existente.
-
-INSTALAÇÃO:
-    pip install playwright pandas
-    playwright install chromium
+Dashboard: https://app.powerbi.com/view?r=eyJrIjoiZTQyNGM4...
 
 USO:
     python3 extrator_horarios_aneel.py
-    python3 extrator_horarios_aneel.py --debug       # com screenshots
-    python3 extrator_horarios_aneel.py --headless    # sem janela (padrão)
+    python3 extrator_horarios_aneel.py --debug
 """
 
-import asyncio
-import argparse
-import json
-import re
-import sys
+import asyncio, argparse, json, re, sys, unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
 try:
     from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 except ImportError:
-    print("❌  Execute: pip install playwright && playwright install chromium")
-    sys.exit(1)
+    print("❌  pip install playwright && playwright install chromium"); sys.exit(1)
 
 DASHBOARD_URL = (
     "https://app.powerbi.com/view?r=eyJrIjoiZTQyNGM4ZWItYzI2ZC00YmU0LTg0OWUt"
     "NzMwODRmMmFhNTcwIiwidCI6IjQwZDZmOWI4LWVjYTctNDZhMi05MmQ0LWVhNGU5YzAxNz"
     "BlMSIsImMiOjR9"
 )
-
 REPO_DIR  = Path("/Users/diogosilva/Documents/Claude/Tarifa Justa/tarifas-aneel")
 JSON_PATH = REPO_DIR / "data" / "tarifas_aneel.json"
-
-LOAD_WAIT_MS   = 20_000
-RENDER_WAIT_MS = 3_000
-DEBUG_DIR      = Path("debug_horarios")
+LOAD_WAIT = 22_000
+DEBUG_DIR = REPO_DIR / "debug_horarios"
 
 
-# ─── EXTRAÇÃO DA TABELA ───────────────────────────────────────────────────────
+# ─── JS: extrai a tabela completa ─────────────────────────────────────────────
+# A tabela Power BI tem duas partes:
+#   1. Coluna de rótulos (nomes das distribuidoras) — role="rowheader" ou primeira coluna fixa
+#   2. Células de dados (horários) — role="gridcell" class="pivotTableCellNoWrap"
+# Ambas têm role="row" como pai, mas em containers separados.
+# A estratégia é pegar todas as rows e dentro de cada row pegar todas as gridcells.
 
-GET_TABLE_JS = """
+EXTRACT_JS = """
 () => {
-    // Procura a tabela com dados de horários
-    // O Power BI renderiza tabelas como elementos com role="grid" ou "table"
-    const results = [];
+    // Estrutura confirmada por diagnóstico:
+    // Cada [role="row"] tem 6 gridcells:
+    //   [0] class="prefix-cell"           → "Selecionar Linha" (ignorar)
+    //   [1] class="pivotTableCellNoWrap"  → Nome da distribuidora
+    //   [2] class="pivotTableCellNoWrap"  → Intermediário 1
+    //   [3] class="pivotTableCellNoWrap"  → Horário Ponta
+    //   [4] class="pivotTableCellNoWrap"  → Intermediário 2
+    //   [5] class="pivotTableCellNoWrap"  → REH
+    const TIME_RE = /\\d{1,2}:\\d{2}/;
+    const rows = [];
 
-    // Tenta por role="row"
-    const rows = document.querySelectorAll('[role="row"]');
-    for (const row of rows) {
-        const cells = row.querySelectorAll('[role="gridcell"], [role="cell"], td');
-        if (cells.length >= 4) {
-            const texts = [...cells].map(c => c.textContent.trim());
-            if (texts[0] && texts[0].length > 2) results.push(texts);
-        }
+    for (const row of document.querySelectorAll('[role="row"]')) {
+        // Pega só as células de dados (exclui prefix-cell)
+        const cells = [...row.querySelectorAll('[role="gridcell"]')]
+            .filter(c => !c.classList.contains('prefix-cell'));
+
+        if (cells.length < 4) continue;
+
+        const texts = cells.map(c => c.innerText?.trim() || '');
+
+        // Linha válida: primeira célula é nome (não horário) e tem >= 2 horários
+        const timeCount = texts.slice(1).filter(t => TIME_RE.test(t)).length;
+        if (timeCount < 2) continue;
+        if (TIME_RE.test(texts[0])) continue; // primeira célula não pode ser horário
+
+        rows.push(texts);
+    }
+    return rows;
+}
+"""
+
+# JS alternativo: lê a tabela inteira por posição Y (agrupa células pela mesma linha Y)
+EXTRACT_BY_POSITION_JS = """
+() => {
+    const TIME_RE  = /^\\d{1,2}:\\d{2}-\\d{1,2}:\\d{2}$/;
+    const REH_RE   = /^\\d[\\.\\d]*\\/\\d{4}$/;
+    const NAME_RE  = /^[A-ZÁÉÍÓÚÀÃÕÂÊÔÇÑ][a-záéíóúàãõâêôçñA-Z0-9 \\-\\.]+$/;
+
+    // Coleta TODOS os gridcells com suas posições
+    const cells = [];
+    for (const el of document.querySelectorAll('[role="gridcell"], [role="rowheader"]')) {
+        const text = el.innerText?.trim();
+        if (!text || text.length < 2) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 5 || rect.height < 5) continue;
+        cells.push({
+            text,
+            x: Math.round(rect.left),
+            y: Math.round(rect.top),
+            w: Math.round(rect.width),
+            h: Math.round(rect.height),
+        });
     }
 
-    // Fallback: procura por tabelas HTML normais
-    if (results.length === 0) {
-        for (const table of document.querySelectorAll('table')) {
-            for (const row of table.querySelectorAll('tr')) {
-                const cells = row.querySelectorAll('td, th');
-                if (cells.length >= 3) {
-                    results.push([...cells].map(c => c.textContent.trim()));
+    // Agrupa por linha (Y próximos ± 5px)
+    const rows = {};
+    for (const c of cells) {
+        const key = Math.round(c.y / 5) * 5;
+        if (!rows[key]) rows[key] = [];
+        rows[key].push(c);
+    }
+
+    // Ordena células de cada linha por X e monta array de linhas
+    const result = [];
+    for (const [y, rowCells] of Object.entries(rows).sort((a,b) => a[0]-b[0])) {
+        const sorted = rowCells.sort((a,b) => a.x - b.x);
+        const texts  = sorted.map(c => c.text);
+        // Linha válida: tem ao menos 2 horários
+        const timeCount = texts.filter(t => TIME_RE.test(t) || /\\d{2}:\\d{2}/.test(t)).length;
+        if (timeCount >= 2) result.push(texts);
+    }
+    return result;
+}
+"""
+
+SCROLL_TABLE_JS = """
+() => {
+    // Rola o container scrollável da tabela Power BI
+    let scrolled = false;
+    for (const el of document.querySelectorAll('.scrollable-cells-container, [class*="scroll"]')) {
+        const before = el.scrollTop;
+        el.scrollTop += 250;
+        if (el.scrollTop !== before) { scrolled = true; break; }
+    }
+    // Fallback: rola qualquer container scrollável grande
+    if (!scrolled) {
+        for (const el of document.querySelectorAll('*')) {
+            if (el.scrollHeight > el.clientHeight + 50) {
+                const rect = el.getBoundingClientRect();
+                if (rect.height > 150 && rect.height < 700) {
+                    const before = el.scrollTop;
+                    el.scrollTop += 250;
+                    if (el.scrollTop !== before) { scrolled = true; break; }
                 }
-            }
-        }
-    }
-
-    return results;
-}
-"""
-
-GET_ALL_TEXT_JS = """
-() => {
-    const items = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-    let node;
-    while ((node = walker.nextNode())) {
-        const t = node.textContent.trim();
-        if (t.length > 2) items.push(t);
-    }
-    return [...new Set(items)];
-}
-"""
-
-# Seletores para o dropdown de distribuidoras
-SLICER_SELECTORS = [
-    '[aria-label*="Distribuidora"]',
-    '[aria-label*="distribuidora"]',
-    '[title*="Distribuidora"]',
-    '[role="combobox"]',
-    '.slicer-dropdown-menu',
-]
-
-SCROLL_JS = """
-() => {
-    let scrolled = 0;
-    for (const el of document.querySelectorAll('*')) {
-        if (el.scrollHeight > el.clientHeight + 20) {
-            const style = window.getComputedStyle(el);
-            if ((style.overflow + style.overflowY).includes('auto') ||
-                (style.overflow + style.overflowY).includes('scroll')) {
-                el.scrollTop += 32;
-                scrolled++;
             }
         }
     }
@@ -119,221 +139,197 @@ SCROLL_JS = """
 }
 """
 
-
-# ─── PARSING DOS HORÁRIOS ─────────────────────────────────────────────────────
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def parse_horario(s):
-    """
-    Converte '16:30-17:30' ou '16:30–17:30' para dict padronizado.
-    Retorna None se não for um horário válido.
-    """
-    if not s or not re.search(r'\d{2}:\d{2}', s):
-        return None
-    # Normaliza separadores
-    s = s.replace('–', '-').replace('—', '-').strip()
-    m = re.search(r'(\d{2}:\d{2})\s*[-–]\s*(\d{2}:\d{2})', s)
+    if not s: return None
+    s = re.sub(r'[–—]', '-', s).strip()
+    m = re.search(r'(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})', s)
     if m:
-        return {"inicio": m.group(1), "fim": m.group(2), "raw": s}
+        return {"inicio": m.group(1).zfill(5), "fim": m.group(2).zfill(5)}
     return None
 
-
-def parse_linha_tabela(cells):
+def parse_linha(cells):
     """
-    Interpreta uma linha da tabela do dashboard.
-    Colunas esperadas: Distribuidora | Intermediário 1 | Horário Ponta | Intermediário 2 | REH
-    Retorna dict com os dados ou None se não for linha válida.
+    Ordem confirmada: [nome, int1, ponta, int2, reh]
     """
-    if len(cells) < 4:
-        return None
-
-    # Primeira coluna: nome da distribuidora
+    if len(cells) < 4: return None
     nome = cells[0].strip()
-    if not nome or len(nome) < 3:
-        return None
+    if not nome or len(nome) < 2: return None
     # Exclui cabeçalhos
-    if any(h in nome for h in ["Distribuidora", "Intermediário", "Horário", "REH"]):
+    if any(h in nome for h in ["Distribuidora", "Selecionar", "Intermediário",
+                                 "Horário", "REH", "Região", "Tipo"]):
         return None
-
-    int1  = parse_horario(cells[1]) if len(cells) > 1 else None
-    ponta = parse_horario(cells[2]) if len(cells) > 2 else None
-    int2  = parse_horario(cells[3]) if len(cells) > 3 else None
-    reh   = cells[4].strip() if len(cells) > 4 else None
 
     return {
-        "distribuidora":    nome,
-        "intermediario_1":  int1,
-        "ponta":            ponta,
-        "intermediario_2":  int2,
-        "reh_horarios":     reh,
+        "distribuidora":   nome,
+        "intermediario_1": parse_horario(cells[1]) if len(cells) > 1 else None,
+        "ponta":           parse_horario(cells[2]) if len(cells) > 2 else None,
+        "intermediario_2": parse_horario(cells[3]) if len(cells) > 3 else None,
+        "reh_horarios":    cells[4].strip() if len(cells) > 4 else None,
     }
 
+def normalizar(s):
+    return unicodedata.normalize("NFKD", s or "").encode("ascii","ignore").decode().lower().strip()
 
-# ─── PLAYWRIGHT ───────────────────────────────────────────────────────────────
+def match_key(nome_dash, json_keys):
+    nd = normalizar(nome_dash)
+    for k in json_keys:
+        if normalizar(k) == nd: return k
+    for k in json_keys:
+        kn = normalizar(k)
+        if nd in kn or kn in nd: return k
+    nd2 = re.sub(r'\s*(s\.?a\.?|dis|energia|eletrica|distribuidora)$', '', nd).strip()
+    for k in json_keys:
+        kn2 = re.sub(r'\s*(s\.?a\.?|dis|energia|eletrica|distribuidora)$',
+                     '', normalizar(k)).strip()
+        if nd2 and kn2 and (nd2 in kn2 or kn2 in nd2): return k
+    return None
 
 async def screenshot(page, name, debug):
     if debug:
         DEBUG_DIR.mkdir(exist_ok=True)
-        path = str(DEBUG_DIR / f"{name}.png")
         try:
-            await page.screenshot(path=path)
+            await page.screenshot(path=str(DEBUG_DIR / f"{name}.png"))
             print(f"   📸 {name}.png")
         except: pass
 
 
-async def get_distribuidoras_slicer(page):
-    """Coleta lista de distribuidoras no slicer."""
-    names = set()
-    prev_count = -1
+# ─── EXTRAÇÃO COMPLETA COM SCROLL ─────────────────────────────────────────────
 
-    for _ in range(100):
-        raw = await page.evaluate("""
-        () => {
-            const names = new Set();
-            for (const sel of ['[role="option"]', '[role="listitem"]',
-                               '.slicerText', '[class*="slicerItem"]']) {
-                for (const el of document.querySelectorAll(sel)) {
-                    const t = el.textContent.trim();
-                    if (t.length > 2 && t.length < 60) names.add(t);
-                }
+async def extrair_nomes_coluna_fixa(page):
+    """
+    Extrai os nomes da coluna fixa (frozen) da tabela.
+    No Power BI, a primeira coluna fica num container separado.
+    """
+    nomes = await page.evaluate("""
+    () => {
+        // Procura pela coluna de rótulos/nomes
+        // Geralmente fica num container com classe "row-header" ou similar
+        const candidates = [];
+        for (const el of document.querySelectorAll('[role="rowheader"], .pivotTableCellNoWrap')) {
+            const t = el.innerText?.trim();
+            if (t && t.length > 2 && !/\\d{2}:\\d{2}/.test(t) && !/^\\d+\\.?\\d*\\/\\d{4}$/.test(t)
+                && !['Distribuidora','Região','Tipo','Intermediário','Horário','REH'].some(h => t.includes(h))) {
+                candidates.push(t);
             }
-            return Array.from(names);
         }
-        """)
+        return [...new Set(candidates)];
+    }
+    """)
+    return nomes
 
-        valid = {n for n in raw if not any(x in n for x in
-                 ["Distribuidora", "Região", "Tipo", "Concession"])}
-        names.update(valid)
-
-        if len(names) == prev_count:
-            break
-        prev_count = len(names)
-
-        await page.evaluate(SCROLL_JS)
-        await page.wait_for_timeout(300)
-
-    return sorted(names)
-
-
-async def selecionar_distribuidora(page, nome):
-    """Seleciona uma distribuidora no slicer."""
-    # Tenta abrir o slicer
-    for sel in SLICER_SELECTORS:
-        try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=2000):
-                await el.click()
-                await page.wait_for_timeout(500)
-                break
-        except: pass
-
-    # Clica no item
-    for _ in range(60):
-        for sel in [
-            f'[role="option"]:has-text("{nome}")',
-            f'[role="listitem"]:has-text("{nome}")',
-            f'li:has-text("{nome}")',
-        ]:
-            try:
-                loc = page.locator(sel).first
-                if await loc.is_visible(timeout=400):
-                    await loc.scroll_into_view_if_needed()
-                    await loc.click()
-                    await page.wait_for_timeout(RENDER_WAIT_MS)
-                    return True
-            except: pass
-
-        await page.evaluate(SCROLL_JS)
-        await page.wait_for_timeout(200)
-
-    return False
-
-
-async def extrair_tabela(page):
-    """Extrai os dados da tabela de horários."""
-    rows = await page.evaluate(GET_TABLE_JS)
-    resultados = []
-
-    for row in rows:
-        parsed = parse_linha_tabela(row)
-        if parsed:
-            resultados.append(parsed)
-
-    # Fallback: tenta extrair do texto bruto da página
-    if not resultados:
-        texts = await page.evaluate(GET_ALL_TEXT_JS)
-        # Procura por padrões de horário no texto
-        for i, t in enumerate(texts):
-            if re.match(r'^\d{2}:\d{2}[-–]\d{2}:\d{2}$', t):
-                print(f"   📍 Horário encontrado no texto: {t}")
-
-    return resultados
-
-
-# ─── INTEGRAÇÃO COM O JSON ────────────────────────────────────────────────────
-
-def normalizar_nome(nome):
-    """Normaliza nome para comparação — remove acentos e caixa."""
-    import unicodedata
-    return unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode().lower().strip()
-
-
-def match_distribuidora(nome_dashboard, json_keys):
+async def extrair_dados_por_posicao(page):
     """
-    Tenta encontrar a distribuidora do dashboard no JSON.
-    O dashboard usa nomes como 'Enel SP', o JSON usa 'Enel SP' também —
-    mas pode haver variações.
+    Usa posições Y para correlacionar nomes com horários.
+    Funciona mesmo quando nome e horários estão em containers separados.
     """
-    nome_norm = normalizar_nome(nome_dashboard)
+    data = await page.evaluate("""
+    () => {
+        const TIME_RE = /\\d{1,2}:\\d{2}/;
+        const items = [];
 
-    # Busca exata primeiro
-    for key in json_keys:
-        if normalizar_nome(key) == nome_norm:
-            return key
+        for (const el of document.querySelectorAll('[role="gridcell"], [role="rowheader"]')) {
+            const text = el.innerText?.trim();
+            if (!text || text.length < 2) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 5 || rect.height < 5) continue;
+            // Só pega elementos visíveis na viewport
+            if (rect.top < 0 || rect.top > window.innerHeight) continue;
 
-    # Busca parcial
-    for key in json_keys:
-        key_norm = normalizar_nome(key)
-        if nome_norm in key_norm or key_norm in nome_norm:
-            return key
+            items.push({
+                text,
+                y: Math.round(rect.top),
+                x: Math.round(rect.left),
+                isTime: TIME_RE.test(text),
+                isReh:  /^\\d[\\.\\d]*\\/\\d{4}$/.test(text),
+            });
+        }
 
-    return None
+        // Agrupa por Y (±8px de tolerância)
+        const groups = {};
+        for (const item of items) {
+            const key = Math.round(item.y / 8) * 8;
+            if (!groups[key]) groups[key] = [];
+            groups[key].push(item);
+        }
+
+        // Monta linhas: precisa ter ao menos 2 horários
+        const rows = [];
+        for (const [y, cells] of Object.entries(groups).sort((a,b)=>+a[0]-+b[0])) {
+            cells.sort((a,b) => a.x - b.x);
+            const times = cells.filter(c => c.isTime);
+            if (times.length >= 2) {
+                rows.push(cells.map(c => c.text));
+            }
+        }
+        return rows;
+    }
+    """)
+    return data
+
+async def extrair_todas(page, debug):
+    """Extrai todas as linhas fazendo scroll."""
+    todas = {}
+    prev_count = -1
+    no_new = 0
+
+    while True:
+        # Tenta os dois métodos
+        rows = await page.evaluate(EXTRACT_JS)
+        if not rows:
+            rows = await extrair_dados_por_posicao(page)
+
+        for r in rows:
+            parsed = parse_linha(r)
+            if parsed and parsed["distribuidora"] and parsed["ponta"]:
+                nome = parsed["distribuidora"]
+                if nome not in todas:
+                    todas[nome] = parsed
+
+        print(f"   📊 Linhas acumuladas: {len(todas)}", end="\r")
+
+        if len(todas) == prev_count:
+            no_new += 1
+            if no_new >= 5: break
+        else:
+            no_new = 0
+            prev_count = len(todas)
+
+        scrolled = await page.evaluate(SCROLL_TABLE_JS)
+        if not scrolled:
+            await page.keyboard.press("PageDown")
+        await page.wait_for_timeout(700)
+
+    print()
+    return todas
 
 
-def integrar_horarios(json_path, horarios_por_distrib):
-    """Integra os horários extraídos no JSON de tarifas."""
+# ─── INTEGRAÇÃO NO JSON ───────────────────────────────────────────────────────
+
+def integrar(json_path, horarios):
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
-
-    json_keys = list(data["distribuidoras"].keys())
-    atualizados = 0
-    nao_encontrados = []
-
-    for nome_dash, horarios in horarios_por_distrib.items():
-        key = match_distribuidora(nome_dash, json_keys)
+    keys = list(data["distribuidoras"].keys())
+    ok, nok = 0, []
+    for nome, h in horarios.items():
+        key = match_key(nome, keys)
         if key:
             data["distribuidoras"][key]["horarios_posto"] = {
-                "intermediario_1": horarios.get("intermediario_1"),
-                "ponta":           horarios.get("ponta"),
-                "intermediario_2": horarios.get("intermediario_2"),
-                "reh_horarios":    horarios.get("reh_horarios"),
-                "fonte":           "Dashboard Postos Tarifários ANEEL",
+                "intermediario_1": h.get("intermediario_1"),
+                "ponta":           h.get("ponta"),
+                "intermediario_2": h.get("intermediario_2"),
+                "reh_horarios":    h.get("reh_horarios"),
+                "nota":            "Dias úteis. Sáb/Dom/feriados: Fora Ponta integral.",
                 "extraido_em":     datetime.now(timezone.utc).isoformat(),
-                "nota":            (
-                    "Horários válidos para dias úteis. "
-                    "Sábados, domingos e feriados: Fora Ponta integral."
-                ),
             }
-            atualizados += 1
+            ok += 1
         else:
-            nao_encontrados.append(nome_dash)
-
-    # Atualiza metadados
+            nok.append(nome)
     data["horarios_atualizados_em"] = datetime.now(timezone.utc).isoformat()
-
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
-
-    return atualizados, nao_encontrados
+    return ok, nok
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -347,17 +343,13 @@ async def main():
 
     json_path = Path(args.json)
     if not json_path.exists():
-        print(f"❌  JSON não encontrado: {json_path}")
-        sys.exit(1)
+        print(f"❌  JSON não encontrado: {json_path}"); sys.exit(1)
 
     print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║  Extrator de Horários dos Postos Tarifários — ANEEL          ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
-    print(f"  JSON alvo: {json_path}")
-
-    horarios_por_distrib = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -366,81 +358,52 @@ async def main():
                   "--disable-blink-features=AutomationControlled"],
         )
         ctx = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            locale="pt-BR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
-            ),
+            viewport={"width": 1440, "height": 900}, locale="pt-BR",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
         )
         page = await ctx.new_page()
 
-        print("📡  Abrindo dashboard de horários...")
+        print("📡  Abrindo dashboard...")
         try:
             await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60_000)
         except PwTimeout:
-            print("❌  Timeout — dashboard inacessível")
-            await browser.close()
-            sys.exit(1)
+            print("❌  Timeout"); await browser.close(); sys.exit(1)
 
-        print(f"⏳  Aguardando Power BI renderizar (~{LOAD_WAIT_MS//1000}s)...")
-        await page.wait_for_timeout(LOAD_WAIT_MS)
-        await screenshot(page, "01_inicial", args.debug)
+        print(f"⏳  Aguardando renderização (~{LOAD_WAIT//1000}s)...")
+        await page.wait_for_timeout(LOAD_WAIT)
+        await screenshot(page, "01_carregado", args.debug)
 
-        # Tenta extrair tabela sem selecionar distribuidora
-        # (se o dashboard mostrar todas de uma vez)
-        print("\n🔍  Verificando se tabela mostra todas as distribuidoras...")
-        rows_all = await extrair_tabela(page)
+        print("📋  Extraindo horários (com scroll)...")
+        horarios = await extrair_todas(page, args.debug)
 
-        if rows_all:
-            print(f"  ✅ {len(rows_all)} linhas encontradas sem filtro")
-            for row in rows_all:
-                horarios_por_distrib[row["distribuidora"]] = row
-        else:
-            # Precisa iterar pelas distribuidoras no slicer
-            print("  ℹ️  Tabela não visível — iterando pelo slicer...")
-            distribuidoras = await get_distribuidoras_slicer(page)
-            print(f"  📋 {len(distribuidoras)} distribuidoras no slicer: {distribuidoras[:5]}...")
-
-            total = len(distribuidoras)
-            for idx, nome in enumerate(distribuidoras, 1):
-                print(f"  [{idx:02d}/{total}] {nome}")
-
-                if not await selecionar_distribuidora(page, nome):
-                    print(f"    ✗ Não foi possível selecionar")
-                    continue
-
-                await screenshot(page, f"{idx:02d}_{nome[:20]}", args.debug)
-                rows = await extrair_tabela(page)
-
-                if rows:
-                    row = rows[0]  # pega a linha da distribuidora selecionada
-                    horarios_por_distrib[nome] = row
-                    p_str = row.get("ponta", {})
-                    p_raw = p_str.get("raw", "?") if p_str else "?"
-                    print(f"    ✓ Ponta: {p_raw}")
-                else:
-                    print(f"    ✗ Sem dados")
-
+        if args.debug:
+            await screenshot(page, "02_final", args.debug)
         await browser.close()
 
-    if not horarios_por_distrib:
-        print("\n❌  Nenhum horário extraído.")
+    print(f"\n✅  {len(horarios)} distribuidoras extraídas")
+
+    if not horarios:
+        print("❌  Nenhum dado extraído — verifique debug screenshots")
         sys.exit(1)
 
-    print(f"\n✅  {len(horarios_por_distrib)} distribuidoras com horários extraídos")
+    # Resumo
+    print(f"\n{'─'*60}")
+    for nome, h in sorted(horarios.items())[:8]:
+        p = h.get("ponta") or {}
+        print(f"  {nome:<28} Ponta: {p.get('inicio','?')}–{p.get('fim','?')}")
+    if len(horarios) > 8:
+        print(f"  ... e mais {len(horarios)-8}")
+    print(f"{'─'*60}")
 
-    # Integra no JSON
     print(f"\n🔄  Integrando no JSON...")
-    atualizados, nao_encontrados = integrar_horarios(json_path, horarios_por_distrib)
-
-    print(f"  ✅ {atualizados} distribuidoras atualizadas no JSON")
-    if nao_encontrados:
-        print(f"  ⚠️  Não encontrados no JSON: {nao_encontrados}")
+    ok, nok = integrar(json_path, horarios)
+    print(f"  ✅ {ok} distribuidoras atualizadas no JSON")
+    if nok:
+        print(f"  ⚠️  Sem match ({len(nok)}): {nok[:8]}")
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║  Concluído! {atualizados} distribuidoras com horários integrados
+║  Concluído! {ok} distribuidoras com horários integrados
 ╚══════════════════════════════════════════════════════════════╝
 
 Próximo passo:
@@ -449,7 +412,6 @@ Próximo passo:
   git commit -m "chore: adiciona horários dos postos tarifários"
   git push
 """)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
