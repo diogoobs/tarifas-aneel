@@ -1,0 +1,40 @@
+name: Atualizar Tarifas ANEEL
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  extrair:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install pandas openpyxl requests
+
+      - name: Extrair tarifas via proxy
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
+        run: python scripts/extrator_tarifas_aneel.py --output data/tarifas_aneel.json
+
+      - name: Verificar resultado
+        run: |
+          python3 -c "import json; from pathlib import Path; d=json.loads(Path('data/tarifas_aneel.json').read_text()); t=len(d.get('distribuidoras',{})); print(f'OK {t} distribuidoras'); __import__('sys').exit(0 if t>0 else 1)"
+
+      - name: Commitar se houve mudanca
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/tarifas_aneel.json
+          git diff --staged --quiet && echo "Sem mudancas." || (git commit -m "chore: atualiza tarifas ANEEL $(date -u +%Y-%m-%d)" && git push)
