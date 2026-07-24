@@ -1,5 +1,7 @@
-name: Atualizar Tarifas ANEEL
+name: Atualizar Tarifas ANEEL (CKAN)
 
+# Extração direta do Dados Abertos da ANEEL (CKAN). Sem proxy, sem Playwright,
+# sem download manual de xlsx. Roda toda segunda 09:00 UTC e commita se mudou.
 on:
   schedule:
     - cron: "0 9 * * 1"
@@ -20,17 +22,14 @@ jobs:
           cache: "pip"
 
       - name: Instalar dependencias
-        run: pip install pandas openpyxl requests
+        run: pip install requests pandas
 
-      - name: Extrair tarifas via proxy
-        env:
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
-        run: python scripts/extrator_tarifas_aneel.py --output data/tarifas_aneel.json
+      - name: Extrair tarifas (CKAN direto)
+        run: python atualizar_ckan.py --output data/tarifas_aneel.json
 
       - name: Verificar resultado
         run: |
-          python3 -c "import json; from pathlib import Path; d=json.loads(Path('data/tarifas_aneel.json').read_text()); t=len(d.get('distribuidoras',{})); print(f'OK {t} distribuidoras'); __import__('sys').exit(0 if t>0 else 1)"
+          python3 -c "import json,sys; from pathlib import Path; d=json.loads(Path('data/tarifas_aneel.json').read_text()); dist=d.get('distribuidoras',{}); print(f'{len(dist)} distribuidoras'); sys.exit(0 if (len(dist)>=40 and 'Enel SP' in dist) else 1)"
 
       - name: Commitar se houve mudanca
         run: |
