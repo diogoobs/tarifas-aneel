@@ -26,6 +26,7 @@ Resource id: fcf2906c-7c32-4b9b-a637-054e7a5234f4
 import argparse
 import json
 import sys
+import time
 import tempfile
 import unicodedata
 from datetime import datetime, timezone
@@ -130,41 +131,62 @@ RENOMEAR = {
 }
 
 
-def baixar_csv() -> str:
-    ultimo_erro = None
-    for url in URLS:
-        print(f"📡  Baixando de: {url}")
+TENTATIVAS = 4                 # rodadas completas sobre a lista URLS
+ESPERAS = [15, 45, 90]         # backoff (s) entre rodadas
+MIN_BYTES = 1_000_000          # abaixo disso o CSV veio truncado
+
+
+def _baixar_uma(url: str) -> str:
+    """Baixa e parseia UMA url. Devolve o CSV normalizado ou levanta exceção."""
+    with requests.get(url, headers=HEADERS, timeout=180, stream=True) as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(f"HTTP {resp.status_code}")
+        esperado = resp.headers.get("Content-Length")
+        tmp = Path(tempfile.gettempdir()) / "aneel_ckan.csv"
+        total = 0
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    f.write(chunk); total += len(chunk)
+    print(f"   ✅ {total/1024:.0f} KB")
+    if total < MIN_BYTES:
+        raise RuntimeError(f"resposta muito curta ({total} bytes)")
+    if esperado and total < int(esperado) * 0.99:
+        raise RuntimeError(f"download truncado ({total} de {esperado} bytes)")
+    for sep in (";", ",", None):
         try:
-            with requests.get(url, headers=HEADERS, timeout=180, stream=True) as resp:
-                if resp.status_code != 200:
-                    print(f"   ↳ HTTP {resp.status_code}, tento a próxima…")
-                    ultimo_erro = f"HTTP {resp.status_code} em {url}"
-                    continue
-                tmp = Path(tempfile.gettempdir()) / "aneel_ckan.csv"
-                total = 0
-                with open(tmp, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1 << 16):
-                        if chunk:
-                            f.write(chunk); total += len(chunk)
-                print(f"   ✅ {total/1024:.0f} KB")
-                if total < 10_000:
-                    ultimo_erro = f"resposta muito curta ({total} bytes)"
-                    print("   ↳ poucos bytes, tento a próxima…"); continue
-                for sep in (";", ",", None):
-                    try:
-                        df = pd.read_csv(tmp, sep=sep, dtype=str,
-                                         engine="python" if sep is None else "c",
-                                         encoding="utf-8", on_bad_lines="skip")
-                        if df.shape[1] > 3:
-                            print(f"   ✅ {len(df):,} linhas × {df.shape[1]} colunas (sep={sep!r})")
-                            return df.to_csv(sep=";", index=False)
-                    except Exception:
-                        continue
-                ultimo_erro = f"não consegui parsear o CSV de {url}"
-        except requests.RequestException as e:
-            ultimo_erro = f"{type(e).__name__}: {e}"
-            print(f"   ↳ falhou: {ultimo_erro}"); continue
-    print(f"❌  Nenhuma fonte respondeu. Último erro: {ultimo_erro}"); sys.exit(1)
+            df = pd.read_csv(tmp, sep=sep, dtype=str,
+                             engine="python" if sep is None else "c",
+                             encoding="utf-8", on_bad_lines="skip")
+            if df.shape[1] > 3:
+                print(f"   ✅ {len(df):,} linhas × {df.shape[1]} colunas (sep={sep!r})")
+                return df.to_csv(sep=";", index=False)
+        except Exception:
+            continue
+    raise RuntimeError("não consegui parsear o CSV")
+
+
+def baixar_csv() -> str:
+    """Tenta cada fonte de URLS; repete a lista inteira com backoff.
+
+    A ANEEL derruba a conexão TLS sob carga (SSLError UNEXPECTED_EOF, run #20 de
+    14/09/2026 morreu assim em 12s). O corte é transitório: quem insiste passa.
+    """
+    ultimo_erro = None
+    for rodada in range(1, TENTATIVAS + 1):
+        for url in URLS:
+            print(f"📡  [rodada {rodada}/{TENTATIVAS}] Baixando de: {url}")
+            try:
+                return _baixar_uma(url)
+            except Exception as e:
+                ultimo_erro = f"{type(e).__name__}: {e}"
+                print(f"   ↳ falhou: {ultimo_erro}")
+        if rodada < TENTATIVAS:
+            espera = ESPERAS[min(rodada - 1, len(ESPERAS) - 1)]
+            print(f"⏳  Todas as fontes falharam na rodada {rodada}; nova tentativa em {espera}s…")
+            time.sleep(espera)
+    print(f"❌  Nenhuma fonte respondeu após {TENTATIVAS} rodadas. Último erro: {ultimo_erro}")
+    sys.exit(1)
 
 
 def rechavear(resultado: dict) -> tuple[dict, list]:
